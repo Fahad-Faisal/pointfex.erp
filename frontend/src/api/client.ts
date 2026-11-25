@@ -1,0 +1,1515 @@
+// Pointfex ERP API Client — HttpOnly Cookie JWT Authentication + Single-Flight Refresh Rotation
+
+export function normalizeApiBase(raw?: string): string {
+  if (!raw || !raw.trim()) {
+    return '/api'
+  }
+  const trimmed = raw.trim().replace(/\/+$/, '')
+  if (!trimmed || trimmed === '/' || trimmed === '/api') {
+    return '/api'
+  }
+  if (trimmed.endsWith('/api')) {
+    return trimmed
+  }
+  return `${trimmed}/api`
+}
+
+export const API_BASE = normalizeApiBase(
+  (import.meta.env.VITE_API_URL as string | undefined) ||
+  (import.meta.env.VITE_API_BASE_URL as string | undefined),
+)
+
+export interface LeaderboardProfile {
+  userId: string
+  name: string
+  role: string
+  kpiSeries: {
+    year: number
+    weekNumber: number
+    score: number | null
+    isInactive: boolean
+    isProvisional: boolean
+    evaluations: { role: string; score: number; status: string }[]
+  }[]
+  tasks: {
+    id: string
+    title: string
+    completedAt: string | null
+    pmScore: number | null
+    evaluations: { role: string; score: number; status: string }[]
+  }[]
+}
+
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+const TOKEN_KEY = 'pointfex_access_token'
+const REFRESH_TOKEN_KEY = 'pointfex_refresh_token'
+
+export function getStoredAccessToken(): string | null {
+  try {
+    return localStorage.getItem(TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function getStoredRefreshToken(): string | null {
+  try {
+    return localStorage.getItem(REFRESH_TOKEN_KEY)
+  } catch {
+    return null
+  }
+}
+
+export function setStoredTokens(accessToken?: string, refreshToken?: string) {
+  try {
+    if (accessToken) localStorage.setItem(TOKEN_KEY, accessToken)
+    if (refreshToken) localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken)
+  } catch {
+    // ignore
+  }
+}
+
+export function clearStoredTokens() {
+  try {
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(REFRESH_TOKEN_KEY)
+  } catch {
+    // ignore
+  }
+}
+
+let onUnauthorizedCallback: (() => void) | null = null
+let refreshInFlight: Promise<boolean> | null = null
+
+export function setOnUnauthorized(cb: (() => void) | null) {
+  onUnauthorizedCallback = () => {
+    clearStoredTokens()
+    cb?.()
+  }
+}
+
+async function attemptSessionRefresh(): Promise<boolean> {
+  if (refreshInFlight) {
+    return refreshInFlight
+  }
+
+  const refreshToken = getStoredRefreshToken()
+
+  refreshInFlight = fetch(`${API_BASE}/auth/refresh`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(refreshToken ? { 'X-Refresh-Token': refreshToken } : {}),
+    },
+    body: JSON.stringify({ refreshToken }),
+  })
+    .then(async (res) => {
+      if (res.ok) {
+        try {
+          const data = await res.json()
+          if (data?.accessToken || data?.token) {
+            setStoredTokens(data.accessToken || data.token, data.refreshToken)
+          }
+        } catch {
+          // ignore
+        }
+        return true
+      }
+      return false
+    })
+    .catch(() => false)
+    .finally(() => {
+      refreshInFlight = null
+    })
+
+  return refreshInFlight
+}
+
+async function parseErrorMessage(res: Response): Promise<string> {
+  let message = `Request failed (${res.status})`
+  try {
+    const errBody = await res.json()
+    if (Array.isArray(errBody?.message)) {
+      message = errBody.message.join(', ')
+    } else if (typeof errBody?.message === 'string') {
+      message = errBody.message
+    }
+  } catch {
+    // ignore non-JSON errors
+  }
+  return message
+}
+
+export async function apiRequest<T>(
+  path: string,
+  options: RequestInit = {},
+  _retried = false,
+): Promise<T> {
+  const headers = new Headers(options.headers || {})
+  if (!headers.has('Content-Type') && options.body) {
+    headers.set('Content-Type', 'application/json')
+  }
+
+  const token = getStoredAccessToken()
+  if (token && !headers.has('Authorization')) {
+    headers.set('Authorization', `Bearer ${token}`)
+  }
+
+  const res = await fetch(`${API_BASE}${path}`, {
+    ...options,
+    credentials: 'include',
+    headers,
+  })
+
+  const isAuthLifecycleRoute =
+    path.startsWith('/auth/login') ||
+    path.startsWith('/auth/refresh') ||
+    path.startsWith('/auth/logout') ||
+    path.startsWith('/auth/reset-password') ||
+    path.startsWith('/auth/forgot-password') ||
+    path.startsWith('/auth/google')
+
+  if (res.status === 401 && !isAuthLifecycleRoute && !_retried) {
+    const refreshed = await attemptSessionRefresh()
+    if (refreshed) {
+      return apiRequest<T>(path, options, true)
+    }
+    onUnauthorizedCallback?.()
+    throw new ApiError('Session expired. Please sign in again.', 401)
+  }
+
+  if (!res.ok) {
+    const message = await parseErrorMessage(res)
+    if (res.status === 401 && !isAuthLifecycleRoute) {
+      onUnauthorizedCallback?.()
+    }
+    throw new ApiError(message, res.status)
+  }
+
+  if (res.status === 204) {
+    return undefined as T
+  }
+
+  return res.json() as Promise<T>
+}
+
+export interface AuthSessionUser {
+  id: string
+  email: string
+  name: string
+  title: string
+  initials: string
+  avatarUrl?: string | null
+  status: string
+  isSuspended: boolean
+  mustChangePassword?: boolean
+  mustEnrollMfa?: boolean
+  mfaEnabled?: boolean
+  role: string
+  roles: Array<{ id: string; slug: string; name: string }>
+  permissions: string[]
+}
+
+export const erpApi = {
+  // Authentication (HttpOnly SameSite=Strict Cookies + Refresh Rotation)
+  login: async (
+    email: string,
+    password: string,
+    options?: { mfaCode?: string; recoveryCode?: string },
+  ) => {
+    const res = await apiRequest<{
+      authenticated: boolean
+      accessToken?: string
+      refreshToken?: string
+      token?: string
+      mfaRequired?: boolean
+      methods?: string[]
+      user?: AuthSessionUser
+    }>('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({
+        email,
+        password,
+        ...(options?.mfaCode ? { mfaCode: options.mfaCode } : {}),
+        ...(options?.recoveryCode ? { recoveryCode: options.recoveryCode } : {}),
+      }),
+    })
+    if (res?.authenticated && (res.accessToken || res.token)) {
+      setStoredTokens(res.accessToken || res.token, res.refreshToken)
+    }
+    return res
+  },
+  getGoogleAuthUrl: () => apiRequest<{ url: string }>('/auth/google'),
+  exchangeGoogleCode: async (body: {
+    code?: string
+    pendingToken?: string
+    mfaCode?: string
+    recoveryCode?: string
+  }) => {
+    const res = await apiRequest<{
+      authenticated: boolean
+      accessToken?: string
+      refreshToken?: string
+      token?: string
+      mfaRequired?: boolean
+      pendingToken?: string
+      methods?: string[]
+      user?: AuthSessionUser
+    }>('/auth/google/exchange', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    })
+    if (res?.authenticated && (res.accessToken || res.token)) {
+      setStoredTokens(res.accessToken || res.token, res.refreshToken)
+    }
+    return res
+  },
+  refreshSession: () =>
+    apiRequest<{
+      authenticated: boolean
+      user: AuthSessionUser
+    }>('/auth/refresh', {
+      method: 'POST',
+    }),
+  logoutSession: () => {
+    clearStoredTokens()
+    return apiRequest<{ loggedOut: boolean }>('/auth/logout', {
+      method: 'POST',
+    })
+  },
+  getAuthMe: () => apiRequest<AuthSessionUser>('/auth/me'),
+  changePassword: (currentPassword?: string, newPassword?: string, mfaCode?: string) =>
+    apiRequest<{ changed: boolean; mustChangePassword: boolean; mustEnrollMfa: boolean }>(
+      '/auth/change-password',
+      {
+        method: 'POST',
+        headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+        body: JSON.stringify({
+          ...(currentPassword ? { currentPassword } : {}),
+          newPassword,
+          ...(mfaCode ? { mfaCode } : {}),
+        }),
+      },
+    ),
+  enrollMfa: () =>
+    apiRequest<{
+      enrolled: boolean
+      secretHex: string
+      base32Secret?: string
+      otpauthUrl?: string
+      previewCurrentCode?: string
+    }>('/rbac/security/mfa/enroll', { method: 'POST' }),
+  verifyMfa: (code: string) =>
+    apiRequest<{ verified: boolean; method: string; mustEnrollMfa?: boolean }>(
+      '/rbac/security/mfa/verify',
+      {
+        method: 'POST',
+        body: JSON.stringify({ code }),
+      },
+    ),
+
+  // Employees & Positions
+  getEmployees: () => apiRequest<any[]>('/employees'),
+  createEmployee: (
+    body: {
+      name: string
+      email: string
+      title: string
+      roleSlug?: string
+      teamId?: string
+      reason?: string
+    },
+    mfaCode?: string,
+  ) =>
+    apiRequest<{
+      employee: any
+      deliveryStatus: 'queued' | 'sent' | 'failed'
+      emailSent: boolean
+      deliveryError?: string | null
+    }>('/employees', {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'users:assign_role',
+            'X-MFA-Target': 'global',
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  updateEmployee: (id: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/employees/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  getPositions: () => apiRequest<any[]>('/positions'),
+  assignPosition: (body: { employeeId: string; positionId: string }) =>
+    apiRequest<any>('/positions/assignments', { method: 'POST', body: JSON.stringify(body) }),
+
+  // Teams
+  getTeams: () => apiRequest<any[]>('/teams'),
+  createTeam: (body: Record<string, unknown>) =>
+    apiRequest<any>('/teams', { method: 'POST', body: JSON.stringify(body) }),
+  updateTeam: (id: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/teams/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  addTeamMember: (teamId: string, body: { employeeId: string; isLead?: boolean }) =>
+    apiRequest<any>(`/teams/${teamId}/members`, { method: 'POST', body: JSON.stringify(body) }),
+  removeTeamMember: (teamId: string, employeeId: string) =>
+    apiRequest<any>(`/teams/${teamId}/members/${employeeId}`, { method: 'DELETE' }),
+  getTeamResources: (teamId: string) => apiRequest<any[]>(`/teams/${teamId}/resources`),
+  getAllTeamResources: () => apiRequest<any[]>('/teams/resources/all'),
+  addTeamResource: (teamId: string, body: { url: string; description?: string; title?: string }) =>
+    apiRequest<any>(`/teams/${teamId}/resources`, { method: 'POST', body: JSON.stringify(body) }),
+
+  // Projects & Milestones
+  getProjects: () => apiRequest<any[]>('/projects'),
+  createProject: (body: Record<string, unknown>) =>
+    apiRequest<any>('/projects', { method: 'POST', body: JSON.stringify(body) }),
+  updateProject: (id: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/projects/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  addMilestone: (projectId: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/projects/${projectId}/milestones`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateMilestoneStatus: (projectId: string, milestoneId: string, status: string) =>
+    apiRequest<any>(`/projects/${projectId}/milestones/${milestoneId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    }),
+  assignProjectTeam: (projectId: string, teamId: string) =>
+    apiRequest<any>(`/projects/${projectId}/assign-team`, {
+      method: 'POST',
+      body: JSON.stringify({ teamId }),
+    }),
+
+  // Tasks
+  getTasks: () => apiRequest<any[]>('/tasks'),
+  createTask: (body: Record<string, unknown>) =>
+    apiRequest<any>('/tasks', { method: 'POST', body: JSON.stringify(body) }),
+  updateTask: (id: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/tasks/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+  updateTaskStatus: (
+    id: string,
+    status: string,
+    extra?: { cancellationReason?: string; pmScore?: number },
+  ) =>
+    apiRequest<any>(`/tasks/${id}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status, ...extra }),
+    }),
+  approveTask: (id: string, body: { feedback?: string; pmScore?: number; payoutAmount?: number }) =>
+    apiRequest<any>(`/tasks/${id}/approve`, { method: 'POST', body: JSON.stringify(body) }),
+  // ponytail: Direct C-level grading / score assignment on any task
+  scoreTaskExec: (taskId: string, body: { score: number; reason?: string }) =>
+    apiRequest<any>(`/tasks/${taskId}/exec-score`, { method: 'POST', body: JSON.stringify(body) }),
+  // ponytail: Direct CHRO / Executive task weight modification anytime
+  changeTaskWeight: (
+    taskId: string,
+    body: { weightPoints?: number; weightCategory?: string; reason?: string },
+  ) =>
+    apiRequest<any>(`/tasks/${taskId}/weight`, { method: 'PATCH', body: JSON.stringify(body) }),
+  getTasksByTeam: (teamId: string) => apiRequest<any[]>(`/tasks?teamId=${teamId}`),
+  getTasksByAssignee: (assigneeId: string) => apiRequest<any[]>(`/tasks?assigneeId=${assigneeId}`),
+  rejectTask: (id: string, feedback: string) =>
+    apiRequest<any>(`/tasks/${id}/reject`, { method: 'POST', body: JSON.stringify({ feedback }) }),
+  reassignTask: (id: string, newAssigneeId: string) =>
+    apiRequest<any>(`/tasks/${id}/reassign`, {
+      method: 'POST',
+      body: JSON.stringify({ newAssigneeId }),
+    }),
+  toggleChecklistItem: (taskId: string, itemId: string, completed?: boolean) =>
+    apiRequest<any>(`/tasks/${taskId}/checklist/${itemId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ completed }),
+    }),
+  submitTaskWork: (taskId: string, body: { prUrl?: string; demoUrl?: string; notes?: string }) =>
+    apiRequest<any>(`/tasks/${taskId}/submissions`, { method: 'POST', body: JSON.stringify(body) }),
+  addTaskComment: (taskId: string, content: string) =>
+    apiRequest<any>(`/tasks/${taskId}/comments`, {
+      method: 'POST',
+      body: JSON.stringify({ content }),
+    }),
+
+  // Finance
+  getTreasury: () => apiRequest<any>('/finance/treasury'),
+  getWallets: () => apiRequest<any[]>('/finance/wallets'),
+  getWallet: (employeeId: string) => apiRequest<any>(`/finance/wallets/${employeeId}`),
+  getTransactions: () => apiRequest<any[]>('/finance/transactions'),
+  getBudgetRequests: () => apiRequest<any[]>('/finance/budget-requests'),
+  allocateDeveloperBudget: (body: Record<string, unknown>) =>
+    apiRequest<any>('/finance/allocate-developer', { method: 'POST', body: JSON.stringify(body) }),
+  allocateProjectBudget: (body: Record<string, unknown>) =>
+    apiRequest<any>('/finance/allocate-project', { method: 'POST', body: JSON.stringify(body) }),
+  requestBudgetIncrease: (body: Record<string, unknown>) =>
+    apiRequest<any>('/finance/request-budget', { method: 'POST', body: JSON.stringify(body) }),
+  approveBudgetRequest: (
+    requestId: string,
+    body: { approvedAmount: number; feedback?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/finance/approve-budget/${requestId}`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'treasury:transfer',
+            'X-MFA-Target': requestId,
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  rejectBudgetRequest: (requestId: string, feedback: string, mfaCode?: string) =>
+    apiRequest<any>(`/finance/reject-budget/${requestId}`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'budgets:reject_request',
+            'X-MFA-Target': requestId,
+          }
+        : undefined,
+      body: JSON.stringify({ feedback, reason: feedback }),
+    }),
+  issueFinancialAdjustment: (body: {
+    userId: string
+    amount: number
+    type: 'bonus' | 'penalty'
+    reason: string
+  }) => apiRequest<any>('/finance/adjustment', { method: 'POST', body: JSON.stringify(body) }),
+
+  // Performance
+  getPerformance: () => apiRequest<any[]>('/performance'),
+  recordEvaluation: (body: Record<string, unknown>) =>
+    apiRequest<any>('/performance/evaluations', { method: 'POST', body: JSON.stringify(body) }),
+  issueRecognition: (body: Record<string, unknown>) =>
+    apiRequest<any>('/performance/recognition', { method: 'POST', body: JSON.stringify(body) }),
+  issueDisciplinary: (body: Record<string, unknown>) =>
+    apiRequest<any>('/performance/discipline', { method: 'POST', body: JSON.stringify(body) }),
+
+  // KPI & XP Governance Suite (Pointfex HR Memorandum)
+  getChroWeightQueue: (status?: string) =>
+    apiRequest<any[]>(`/performance/chro/weight-queue${status ? `?status=${status}` : ''}`),
+  verifyTaskWeight: (id: string, body: { approvedWeight: number; notes?: string }) =>
+    apiRequest<any>(`/performance/chro/verify-weight/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  applyDisciplinaryDeduction: (body: { employeeId: string; deductionPoints: number; reason: string }) =>
+    apiRequest<any>('/performance/chro/disciplinary-deduction', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  castConsensusVote: (
+    verificationId: string,
+    body: { decision: 'APPROVE' | 'REJECT'; notes?: string },
+    headers?: Record<string, string>,
+  ) =>
+    apiRequest<any>(`/performance/tasks/weight-verification/${verificationId}/vote`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+      headers,
+    }),
+  getEmployeeKpiHistory: (employeeId: string) =>
+    apiRequest<any[]>(`/performance/kpi-history/${employeeId}`),
+  getEmployeeKpiXpAuditLogs: (employeeId: string) =>
+    apiRequest<any[]>(`/performance/audit-log/${employeeId}`),
+  getPerformanceSummary: (employeeId: string) =>
+    apiRequest<any>(`/performance/summary/${employeeId}`),
+  getExecutivePendingReviews: () =>
+    apiRequest<any[]>('/performance/executive/pending-reviews'),
+  confirmExecutiveReview: (id: string, body?: { overrideScore?: number; notes?: string }) =>
+    apiRequest<any>(`/performance/executive/reviews/${id}/confirm`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+  proposeTaskWeight: (body: {
+    taskId?: string
+    milestoneId?: string
+    proposedWeight: number
+    category?: 'SMALL' | 'MEDIUM' | 'LARGE' | 'CRITICAL' | 'CUSTOM'
+    context?: 'MAIN_SQUAD' | 'OUTSIDE_SQUAD' | 'DIRECT_EXECUTIVE'
+  }) =>
+    apiRequest<any>('/performance/propose-weight', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  overridePerformanceRecord: (
+    body: {
+      targetEmployeeId: string
+      metricType: 'KPI' | 'XP'
+      weekNumber?: number
+      year?: number
+      score?: number | null
+      deltaXp?: number
+      newLifetimeXp?: number
+      reason?: string
+      mfaCode?: string
+    },
+    mfaCodeHeader?: string,
+  ) =>
+    apiRequest<any>('/performance/override', {
+      method: 'POST',
+      headers: mfaCodeHeader ? { 'X-MFA-Code': mfaCodeHeader } : undefined,
+      body: JSON.stringify(body),
+    }),
+  awardMilestoneXpToPm: (milestoneId: string) =>
+    apiRequest<any>(`/performance/milestones/${milestoneId}/approve-xp`, {
+      method: 'POST',
+    }),
+  updateKpiXpAuditLog: (
+    id: string,
+    body: { reason?: string; notes?: string; actionType?: string },
+  ) =>
+    apiRequest<any>(`/performance/audit-log/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+
+  // Phase 1-4 Performance, Ledger & Consensus APIs
+  getMyKpiSeries: () => apiRequest<any>('/performance/kpi/me'),
+  getUserKpiSeries: (userId: string) => apiRequest<any>(`/performance/kpi/${userId}`),
+  getMyXpSummary: () => apiRequest<any>('/performance/xp/me'),
+  getUserXpSummary: (userId: string) => apiRequest<any>(`/performance/xp/${userId}`),
+  getMyLedger: (query?: { cursor?: string; limit?: number; eventType?: string; taskId?: string }) => {
+    const params = new URLSearchParams()
+    if (query?.cursor) params.append('cursor', query.cursor)
+    if (query?.limit) params.append('limit', String(query.limit))
+    if (query?.eventType) params.append('eventType', query.eventType)
+    if (query?.taskId) params.append('taskId', query.taskId)
+    const qs = params.toString()
+    return apiRequest<any>(`/performance/ledger/me${qs ? `?${qs}` : ''}`)
+  },
+  getUserLedger: (userId: string, query?: { cursor?: string; limit?: number; eventType?: string; taskId?: string }) => {
+    const params = new URLSearchParams()
+    if (query?.cursor) params.append('cursor', query.cursor)
+    if (query?.limit) params.append('limit', String(query.limit))
+    if (query?.eventType) params.append('eventType', query.eventType)
+    if (query?.taskId) params.append('taskId', query.taskId)
+    const qs = params.toString()
+    return apiRequest<any>(`/performance/ledger/${userId}${qs ? `?${qs}` : ''}`)
+  },
+  exportLedger: (userId?: string, query?: { format?: 'json' | 'csv' }) => {
+    const params = new URLSearchParams()
+    if (userId) params.append('userId', userId)
+    if (query?.format) params.append('format', query.format)
+    const qs = params.toString()
+    return apiRequest<any>(`/performance/ledger/export${qs ? `?${qs}` : ''}`)
+  },
+  getLeaderboardProfile: (userId: string) =>
+    apiRequest<LeaderboardProfile>(`/performance/leaderboard/${encodeURIComponent(userId)}`),
+  getLeaderboard: (params?: { period?: 'latest_week' | 'four_week_avg' | 'lifetime_xp'; role?: string; squad?: string }) => {
+    const qs = new URLSearchParams()
+    if (params?.period) qs.append('period', params.period)
+    if (params?.role) qs.append('role', params.role)
+    if (params?.squad) qs.append('squad', params.squad)
+    const qStr = qs.toString()
+    return apiRequest<any[]>(`/performance/leaderboard${qStr ? `?${qStr}` : ''}`)
+  },
+  getExecScoresInbox: () => apiRequest<any[]>('/performance/exec-scores/inbox'),
+  confirmExecScore: (id: string) =>
+    apiRequest<any>(`/performance/exec-scores/${id}/confirm`, { method: 'POST' }),
+  adjustExecScore: (id: string, body: { score: number; reason: string }) =>
+    apiRequest<any>(`/performance/exec-scores/${id}/adjust`, { method: 'POST', body: JSON.stringify(body) }),
+  getPmEvaluationsInbox: () => apiRequest<any[]>('/performance/pm-evaluations/inbox'),
+  confirmPmEvaluation: (id: string) =>
+    apiRequest<any>(`/performance/pm-evaluations/${id}/confirm`, { method: 'POST' }),
+  adjustPmEvaluation: (id: string, body: { score: number; reason: string }) =>
+    apiRequest<any>(`/performance/pm-evaluations/${id}/adjust`, { method: 'POST', body: JSON.stringify(body) }),
+  recordCLevelPeerEval: (body: { targetExecutiveId: string; score: number; notes: string }) =>
+    apiRequest<any>('/performance/c-level/peer-eval', { method: 'POST', body: JSON.stringify(body) }),
+  createDisciplinaryDeduction: (
+    body: { userId: string; points: number; reason: string; referenceDocId: string; targetWeekStart: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>('/performance/disciplinary', {
+      method: 'POST',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  reverseDisciplinaryDeduction: (id: string, body: { reason: string }, mfaCode?: string) =>
+    apiRequest<any>(`/performance/disciplinary/${id}/reverse`, {
+      method: 'POST',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  getConsensusTally: (id: string) =>
+    apiRequest<any>(`/performance/tasks/weight-verification/${id}/tally`),
+  ceoConsensusOverride: (id: string, body: { decision: 'APPROVE' | 'REJECT'; reason: string }, mfaCode?: string) =>
+    apiRequest<any>(`/performance/tasks/weight-verification/${id}/ceo-override`, {
+      method: 'POST',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  completeMilestoneWithXp: (id: string, body: { pmId: string; weightPoints: number }) =>
+    apiRequest<any>(`/performance/milestones/${id}/complete-with-xp`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  getPerformanceConfig: () => apiRequest<any>('/performance/config'),
+  updatePerformanceConfig: (body: { kpiConfig?: any; weightConfigs?: any[] }, mfaCode?: string) =>
+    apiRequest<any>('/performance/config', {
+      method: 'PUT',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  getBackfillWindows: () => apiRequest<any[]>('/performance/backfill-windows'),
+  createBackfillWindow: (body: { startsAt: string; endsAt: string; grantedRole?: string; reason?: string }, mfaCode?: string) =>
+    apiRequest<any>('/performance/backfill-windows', {
+      method: 'POST',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  updateBackfillWindow: (id: string, body: { isActive?: boolean; endsAt?: string; reason?: string }, mfaCode?: string) =>
+    apiRequest<any>(`/performance/backfill-windows/${id}`, {
+      method: 'PATCH',
+      headers: mfaCode ? { 'X-MFA-Code': mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+
+  // Reports
+  getReports: () => apiRequest<any[]>('/reports'),
+  createReport: (body: Record<string, unknown>) =>
+    apiRequest<any>('/reports', { method: 'POST', body: JSON.stringify(body) }),
+  updateReportStatus: (id: string, body: { status: string; feedback?: string }) =>
+    apiRequest<any>(`/reports/${id}/status`, { method: 'PATCH', body: JSON.stringify(body) }),
+  forwardReport: (id: string, body: { recipient: string; endorsement: string }) =>
+    apiRequest<any>(`/reports/${id}/forward`, { method: 'POST', body: JSON.stringify(body) }),
+  adjudicateConfidential: (id: string, body: { status: string; mediationNotes: string }) =>
+    apiRequest<any>(`/reports/${id}/confidential`, { method: 'PATCH', body: JSON.stringify(body) }),
+
+  // Audit Logs
+  getAuditLogs: () => apiRequest<any[]>('/audit-logs'),
+
+  // Engineering
+  getQualityGates: () => apiRequest<any[]>('/engineering/quality-gates'),
+  getSecurityAlerts: () => apiRequest<any[]>('/engineering/security-alerts'),
+  createSecurityAlert: (body: Record<string, unknown>) =>
+    apiRequest<any>('/engineering/security-alerts', { method: 'POST', body: JSON.stringify(body) }),
+  updateSecurityAlertStatus: (id: string, status: string) =>
+    apiRequest<any>(`/engineering/security-alerts/${id}/status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    }),
+  getTestRuns: () => apiRequest<any[]>('/engineering/test-runs'),
+
+  // Consultancy
+  getConsultancy: () => apiRequest<any[]>('/consultancy'),
+  updateConsultancy: (id: string, body: Record<string, unknown>) =>
+    apiRequest<any>(`/consultancy/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+
+  // Governance
+  getDirectives: () => apiRequest<any[]>('/governance/directives'),
+  dispatchDirective: (body: Record<string, unknown>) =>
+    apiRequest<any>('/governance/directives', { method: 'POST', body: JSON.stringify(body) }),
+  ratifyDecision: (body: { actionType: string; entityId: string; notes?: string }) =>
+    apiRequest<any>('/governance/ratify', { method: 'POST', body: JSON.stringify(body) }),
+
+  // Communications
+  getAnnouncements: () => apiRequest<any[]>('/announcements'),
+  getNotifications: () => apiRequest<any[]>('/notifications'),
+  markNotificationRead: (id: string) =>
+    apiRequest<any>(`/notifications/${id}/read`, { method: 'PATCH' }),
+  markAllNotificationsRead: () => apiRequest<any>('/notifications/read-all', { method: 'PATCH' }),
+
+  // Dynamic RBAC / PBAC Management (CEO Admin & C-Level Delegation)
+  getMyPermissions: () =>
+    apiRequest<{
+      employeeId: string
+      roles: any[]
+      rolePermissions: string[]
+      directPermissions: any[]
+      permissions: string[]
+    }>('/rbac/me/permissions'),
+  getMyEffectiveAuthz: () => apiRequest<any>('/rbac/me/effective'),
+  getUserEffectiveAuthz: (employeeId: string) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/effective`),
+  listPermissions: () =>
+    apiRequest<{ total: number; permissions: any[]; groupedByModule: Record<string, any[]> }>(
+      '/rbac/permissions',
+    ),
+  listRoleTemplates: () => apiRequest<any[]>('/rbac/role-templates'),
+  createRoleFromTemplate: (
+    code: string,
+    body?: { name?: string; slug?: string; description?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/roles/from-template/${code}`, {
+      method: 'POST',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:create', 'X-MFA-Target': code }
+        : undefined,
+      body: JSON.stringify(body || {}),
+    }),
+  getDelegatablePermissions: () =>
+    apiRequest<{ permissions: any[]; groupedByModule: Record<string, any[]> }>(
+      '/rbac/delegatable-permissions',
+    ),
+  listRoles: () => apiRequest<any[]>('/rbac/roles'),
+  getRole: (id: string) => apiRequest<any>(`/rbac/roles/${id}`),
+  getRoleVersions: (id: string) => apiRequest<any[]>(`/rbac/roles/${id}/versions`),
+  createRole: (
+    body: {
+      name: string
+      slug?: string
+      description?: string
+      permissionCodes?: string[]
+      wildcards?: string[]
+      includeCritical?: boolean
+      tier?: string
+    },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>('/rbac/roles', {
+      method: 'POST',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:create', 'X-MFA-Target': 'global' }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  cloneRole: (
+    id: string,
+    body: { name: string; slug?: string; description?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/roles/${id}/clone`, {
+      method: 'POST',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:update', 'X-MFA-Target': id }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  activateRole: (id: string, reason?: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/roles/${id}/activate`, {
+      method: 'PATCH',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:update', 'X-MFA-Target': id }
+        : undefined,
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  deactivateRole: (id: string, reason?: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/roles/${id}/deactivate`, {
+      method: 'PATCH',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:update', 'X-MFA-Target': id }
+        : undefined,
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  updateRole: (
+    id: string,
+    body: { name?: string; description?: string; isActive?: boolean; wildcards?: string[]; tier?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/roles/${id}`, {
+      method: 'PATCH',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:update', 'X-MFA-Target': id }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  deleteRole: (id: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/roles/${id}`, {
+      method: 'DELETE',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:delete', 'X-MFA-Target': id }
+        : undefined,
+    }),
+  replaceRolePermissions: (
+    id: string,
+    permissionCodes: string[],
+    mfaCode: string,
+    changeReason?: string,
+  ) =>
+    apiRequest<any>(`/rbac/roles/${id}/permissions`, {
+      method: 'PUT',
+      headers: { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'roles:update', 'X-MFA-Target': id },
+      body: JSON.stringify({ permissionCodes, changeReason }),
+    }),
+  listUserRoleAssignments: (employeeId: string) =>
+    apiRequest<any[]>(`/rbac/users/${employeeId}/role-assignments`),
+  getEmployeePermissions: (employeeId: string) =>
+    apiRequest<{
+      employeeId: string
+      roles: any[]
+      rolePermissions: string[]
+      directPermissions: any[]
+      permissions: string[]
+    }>(`/rbac/users/${employeeId}/permissions`),
+  assignRoleToEmployee: (
+    employeeId: string,
+    body: {
+      roleId?: string
+      roleSlug?: string
+      scope?: string
+      scopeIds?: string[]
+      expiresAt?: string
+      reason?: string
+    },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/roles`, {
+      method: 'POST',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'users:assign_role', 'X-MFA-Target': employeeId }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  grantDenial: (
+    employeeId: string,
+    body: { permissionCode: string; scope?: string; scopeIds?: string[]; reason?: string; expiresAt?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/denials`, {
+      method: 'POST',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'permissions:deny_direct', 'X-MFA-Target': employeeId }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  revokeDenial: (denialId: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/denials/${denialId}`, {
+      method: 'DELETE',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'permissions:deny_direct', 'X-MFA-Target': denialId }
+        : undefined,
+    }),
+  // Delegations Engine
+  listMyDelegations: () => apiRequest<{ created: any[]; received: any[] }>('/rbac/delegations/mine'),
+  listAllDelegations: () => apiRequest<any[]>('/rbac/delegations'),
+  createDelegation: (
+    body: {
+      delegateeId: string
+      permissionCodes: string[]
+      scope?: string
+      scopeIds?: string[]
+      reason: string
+      startsAt?: string
+      expiresAt: string
+      requireApproval?: boolean
+    },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>('/rbac/delegations', {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'delegations:create',
+            'X-MFA-Target': body.delegateeId,
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  approveDelegation: (id: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/delegations/${id}/approve`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'delegations:approve',
+            'X-MFA-Target': id,
+          }
+        : undefined,
+      body: '{}',
+    }),
+  revokeDelegation: (id: string, reason?: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/delegations/${id}/revoke`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'delegations:revoke',
+            'X-MFA-Target': id,
+          }
+        : undefined,
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  // Approvals & SoD Engine
+  listSodRules: () => apiRequest<any[]>('/rbac/sod-rules'),
+  getApprovalInbox: () => apiRequest<any[]>('/rbac/approvals/inbox'),
+  getMyApprovals: () => apiRequest<any[]>('/rbac/approvals/mine'),
+  initiateApproval: (body: {
+    actionCode: string
+    entityType: string
+    entityId: string
+    amount?: number
+    reason?: string
+    mode?: string
+  }) => apiRequest<any>('/rbac/approvals', { method: 'POST', body: JSON.stringify(body) }),
+  approveWorkflowStep: (id: string, notes?: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/approvals/${id}/approve`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'approvals:decide',
+            'X-MFA-Target': id,
+          }
+        : undefined,
+      body: JSON.stringify(notes ? { notes, reason: notes } : {}),
+    }),
+  rejectWorkflowStep: (id: string, notes?: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/approvals/${id}/reject`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'approvals:decide',
+            'X-MFA-Target': id,
+          }
+        : undefined,
+      body: JSON.stringify(notes ? { notes, reason: notes } : {}),
+    }),
+  // Audit Chain & Security Sessions
+  verifyAuditChain: () =>
+    apiRequest<{ valid: boolean; checkedCount: number; headSequence?: number; headHash?: string; brokenAtId?: string; brokenReason?: string }>('/audit-logs/verify'),
+  listMySecuritySessions: () => apiRequest<any[]>('/rbac/security-sessions/mine'),
+  revokeSecuritySession: (id: string) =>
+    apiRequest<any>(`/rbac/security-sessions/${id}/revoke`, { method: 'POST', body: '{}' }),
+  revokeRoleFromEmployee: (employeeId: string, roleId: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/roles/${roleId}`, {
+      method: 'DELETE',
+      headers: mfaCode
+        ? { 'X-MFA-Code': mfaCode, 'X-MFA-Action': 'users:assign_role', 'X-MFA-Target': employeeId }
+        : undefined,
+    }),
+  grantDirectPermission: (
+    employeeId: string,
+    body: { permissionCode?: string; permissionId?: string; expiresAt?: string; reason?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/direct-permissions`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'permissions:grant_direct',
+            'X-MFA-Target': employeeId,
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  revokeDirectPermission: (employeeId: string, permissionId: string, mfaCode?: string) =>
+    apiRequest<any>(`/rbac/users/${employeeId}/direct-permissions/${permissionId}`, {
+      method: 'DELETE',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'permissions:grant_direct',
+            'X-MFA-Target': employeeId,
+          }
+        : undefined,
+    }),
+  suspendEmployee: (
+    employeeId: string,
+    body?: { reason?: string; passwordConfirm?: string; verificationToken?: string },
+  ) =>
+    apiRequest<any>(`/users/${employeeId}/suspend`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+  unsuspendEmployee: (employeeId: string, reason?: string) =>
+    apiRequest<any>(`/users/${employeeId}/unsuspend`, {
+      method: 'POST',
+      body: JSON.stringify(reason ? { reason } : {}),
+    }),
+  demoteEmployee: (
+    employeeId: string,
+    body?: { reason?: string; passwordConfirm?: string; verificationToken?: string },
+  ) =>
+    apiRequest<any>(`/users/${employeeId}/demote`, {
+      method: 'POST',
+      body: JSON.stringify(body || {}),
+    }),
+
+  // Governance: Maker-Checker & CEO Succession
+  transferCeo: (body: {
+    newCeoEmployeeId: string
+    demoteToRoleSlug?: string
+    passwordConfirm?: string
+    verificationToken?: string
+    reason?: string
+  }) =>
+    apiRequest<any>('/governance/transfer-ceo', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  listAccessRequests: (params?: { status?: string; targetEmployeeId?: string }) => {
+    const qs = new URLSearchParams()
+    if (params?.status) qs.set('status', params.status)
+    if (params?.targetEmployeeId) qs.set('targetEmployeeId', params.targetEmployeeId)
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return apiRequest<any[]>(`/governance/access-requests${suffix}`)
+  },
+  createAccessRequest: (body: {
+    targetEmployeeId: string
+    requestedRoleId?: string
+    requestedRoleSlug?: string
+    reason?: string
+  }) =>
+    apiRequest<any>('/governance/access-requests', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  approveAccessRequest: (
+    requestId: string,
+    opts?: string | { reviewNotes?: string; reason?: string; mfaCode?: string },
+  ) => {
+    const reason = typeof opts === 'string' ? opts : opts?.reason || opts?.reviewNotes
+    const mfaCode = typeof opts === 'object' ? opts?.mfaCode : undefined
+    return apiRequest<any>(`/governance/access-requests/${requestId}/approve`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'governance:approve_request',
+            'X-MFA-Target': requestId,
+          }
+        : undefined,
+      body: JSON.stringify(reason ? { reason, reviewNotes: reason } : {}),
+    })
+  },
+  rejectAccessRequest: (
+    requestId: string,
+    opts?: string | { reviewNotes?: string; reason?: string; mfaCode?: string },
+  ) => {
+    const reason = typeof opts === 'string' ? opts : opts?.reason || opts?.reviewNotes
+    const mfaCode = typeof opts === 'object' ? opts?.mfaCode : undefined
+    return apiRequest<any>(`/governance/access-requests/${requestId}/reject`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'governance:approve_request',
+            'X-MFA-Target': requestId,
+          }
+        : undefined,
+      body: JSON.stringify(reason ? { reason, reviewNotes: reason } : {}),
+    })
+  },
+
+  // Phase 4B: Fresh MFA & Employee Lifecycle Controls
+  mfaHeaders: (mfaCode: string, actionKey?: string, targetId?: string) => ({
+    'X-MFA-Code': mfaCode,
+    ...(actionKey ? { 'X-MFA-Action': actionKey } : {}),
+    ...(targetId ? { 'X-MFA-Target': targetId } : {}),
+  }),
+  adminResetPassword: (employeeId: string, reason: string, mfaCode: string) =>
+    apiRequest<any>(`/users/${employeeId}/reset-password`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'users:reset_password',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  getMfaSecurityOverview: () =>
+    apiRequest<{
+      summary: {
+        totalUsers: number
+        mfaEnabledCount: number
+        mfaEnabledPct: number
+        lockedUsersCount: number
+        resetsThisMonth: number
+      }
+      employees: Array<{
+        id: string
+        name: string
+        email: string
+        title: string
+        role: string
+        mfaEnabled: boolean
+        mustEnrollMfa: boolean
+        isLocked: boolean
+        mfaLockedUntil?: string | null
+        isSuspended: boolean
+        lastMfaResetAt?: string | null
+      }>
+    }>('/users/security/mfa-overview'),
+  revokeEmployeeSessions: (employeeId: string, reason: string, mfaCode: string) =>
+    apiRequest<any>(`/users/${employeeId}/sessions/revoke`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'mfa:manage',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  adminResetMfa: (employeeId: string, reason: string, mfaCode: string) =>
+    apiRequest<any>(`/users/${employeeId}/mfa/reset`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'mfa:manage',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  unlockSensitiveProfile: (employeeId: string, mfaCode: string) =>
+    apiRequest<{ viewToken: string; expiresAt: string }>(
+      `/employees/${employeeId}/sensitive-profile/unlock`,
+      {
+        method: 'POST',
+        headers: {
+          'X-MFA-Code': mfaCode,
+          'X-MFA-Action': 'employees:read_sensitive',
+          'X-MFA-Target': employeeId,
+        },
+        body: '{}',
+      },
+    ),
+  getSensitiveProfile: (employeeId: string, viewToken: string) =>
+    apiRequest<any>(`/employees/${employeeId}/sensitive-profile`, {
+      headers: { 'X-Profile-View-Token': viewToken },
+    }),
+  getEmployeeChangeHistory: (employeeId: string) =>
+    apiRequest<any[]>(`/employees/${employeeId}/change-history`),
+  promoteEmployee: (
+    employeeId: string,
+    body: { newTitle: string; reason: string; effectiveDate?: string },
+    mfaCode: string,
+  ) =>
+    apiRequest<any>(`/employees/${employeeId}/promotions/approve`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'promotions:approve',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify(body),
+    }),
+  removePosition: (employeeId: string, reason: string, mfaCode: string, positionId?: string) =>
+    apiRequest<any>(`/positions/assignments/${employeeId}/remove`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'positions:remove',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify({ reason, positionId }),
+    }),
+  forgotPassword: (email: string) =>
+    apiRequest<any>('/auth/forgot-password', {
+      method: 'POST',
+      body: JSON.stringify({ email }),
+    }),
+  resetPasswordWithToken: (body: { token: string; newPassword: string; mfaCode?: string }) =>
+    apiRequest<any>('/auth/reset-password', {
+      method: 'POST',
+      headers: body.mfaCode ? { 'X-MFA-Code': body.mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+  regenerateRecoveryCodes: (body: { currentPassword?: string; mfaCode?: string }) =>
+    apiRequest<{ recoveryCodes: string[] }>('/auth/recovery-codes/regenerate', {
+      method: 'POST',
+      headers: body.mfaCode ? { 'X-MFA-Code': body.mfaCode } : undefined,
+      body: JSON.stringify(body),
+    }),
+
+  // CEO-only Login Allowlist & My Account
+  getMySessions: () =>
+    apiRequest<{
+      sessions: Array<{
+        id: string
+        deviceLabel: string
+        ipAddress?: string | null
+        lastActiveAt: string
+        mfaVerified: boolean
+      }>
+      externalIdentities: Array<{
+        id: string
+        provider: string
+        email: string
+        emailVerified: boolean
+        lastLoginAt?: string | null
+      }>
+      hasPassword: boolean
+      mfaEnabled: boolean
+    }>('/auth/me/sessions'),
+  revokeMySession: (id: string) =>
+    apiRequest<{ revoked: boolean }>(`/auth/me/sessions/${id}`, { method: 'DELETE' }),
+  listLoginAllowlist: () =>
+    apiRequest<{
+      allowlistRequired: boolean
+      allowDomainRules: boolean
+      canManage: boolean
+      summary: {
+        allowedEmails: number
+        readyToOnboard: number
+        activeEmployees: number
+        blockedLast7Days: number
+      }
+      entries: Array<{
+        id: string
+        pattern: string
+        isDomain: boolean
+        isActive: boolean
+        isSystemRoot?: boolean
+        note?: string | null
+        createdAt: string
+        employeeId?: string | null
+        employeeName?: string | null
+        employeeSuspended?: boolean
+        lastLoginAt?: string | null
+        lastLoginMethod?: string | null
+        inviteDeliveryStatus?: string | null
+      }>
+      blockedAttempts: Array<{
+        id: string
+        maskedEmail: string
+        provider: string
+        reason: string
+        ipAddress?: string | null
+        createdAt: string
+      }>
+      pendingRequests: Array<{
+        id: string
+        email: string
+        fullName: string
+        reason: string
+        requesterId: string
+        status: string
+        createdAt: string
+      }>
+    }>('/auth/allowlist'),
+  getReadyToOnboardEmails: () =>
+    apiRequest<Array<{ email: string }>>('/auth/allowlist/ready-emails'),
+  addLoginAllowlistEntry: (
+    pattern: string,
+    note: string | undefined,
+    mfaCode: string,
+    reason?: string,
+  ) =>
+    apiRequest<any>('/auth/allowlist', {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': 'global',
+      },
+      body: JSON.stringify({ pattern, note, reason }),
+    }),
+  importLoginAllowlist: (
+    entries: string[] | string,
+    note: string | undefined,
+    mfaCode: string,
+    reason?: string,
+  ) =>
+    apiRequest<{ imported: number; patterns: string[] }>('/auth/allowlist/import', {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': 'global',
+      },
+      body: JSON.stringify({ entries, note, reason }),
+    }),
+  toggleLoginAllowlistEntry: (
+    id: string,
+    isActive: boolean,
+    mfaCode: string,
+    reason?: string,
+  ) =>
+    apiRequest<any>(`/auth/allowlist/${id}`, {
+      method: 'PATCH',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify({ isActive, reason }),
+    }),
+  removeLoginAllowlistEntry: (id: string, mfaCode: string, reason?: string) =>
+    apiRequest<any>(`/auth/allowlist/${id}`, {
+      method: 'DELETE',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  requestAllowlistEmail: (body: { email: string; fullName: string; reason: string }) =>
+    apiRequest<any>('/auth/allowlist/requests', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  listAllowlistEmailRequests: () => apiRequest<any[]>('/auth/allowlist/requests'),
+  approveAllowlistEmailRequest: (id: string, mfaCode: string, reason?: string) =>
+    apiRequest<any>(`/auth/allowlist/requests/${id}/approve`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  rejectAllowlistEmailRequest: (id: string, mfaCode: string, reason: string) =>
+    apiRequest<any>(`/auth/allowlist/requests/${id}/reject`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'login_allowlist:manage',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+  resendEmployeeInvite: (employeeId: string, mfaCode: string, reason?: string) =>
+    apiRequest<{
+      employeeId: string
+      deliveryStatus: string
+      emailSent: boolean
+      deliveryError?: string | null
+    }>(`/employees/${employeeId}/resend-invite`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'users:reset_password',
+        'X-MFA-Target': employeeId,
+      },
+      body: JSON.stringify({ reason }),
+    }),
+
+  // Phase 3 & 4: Tiers, CEO Direct Identity & Session Hardening
+  logoutAllDevices: () =>
+    apiRequest<{ loggedOut: boolean; revokedCount: number }>('/auth/me/sessions/logout-all', {
+      method: 'POST',
+    }),
+  updateUserIdentity: (
+    id: string,
+    body: { fullName: string; email: string; reason: string },
+    mfaCode: string,
+  ) =>
+    apiRequest<any>(`/employees/${id}/identity`, {
+      method: 'PATCH',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'users:edit_identity',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify(body),
+    }),
+  setRoleTier: (roleId: string, tier: string, mfaCode: string, reason: string) =>
+    apiRequest<any>(`/rbac/roles/${roleId}/tier`, {
+      method: 'PATCH',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'roles:update',
+        'X-MFA-Target': roleId,
+      },
+      body: JSON.stringify({ tier, reason }),
+    }),
+
+  // Phase 5: Access History
+  getAccessHistory: (params?: {
+    page?: number
+    limit?: number
+    actorId?: string
+    targetEmployeeId?: string
+    changeType?: string
+    from?: string
+    to?: string
+  }) => {
+    const qs = params ? '?' + new URLSearchParams(params as any).toString() : ''
+    return apiRequest<{
+      items: any[]
+      total: number
+      page: number
+      limit: number
+      totalPages: number
+    }>(`/rbac/access-history${qs}`)
+  },
+  exportAccessHistory: (format: 'json' | 'csv' = 'json') =>
+    apiRequest<any>(`/rbac/access-history/export?format=${format}`),
+
+  // Phase 7: Projects, Votes, Budgets, Proposals
+  createProjectCreationRequest: (body: any, mfaCode?: string) =>
+    apiRequest<any>('/projects/requests', {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'projects:request',
+            'X-MFA-Target': 'new',
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  listProjectCreationRequests: (params?: { status?: string }) => {
+    const qs = params?.status ? `?status=${params.status}` : ''
+    return apiRequest<any[]>(`/projects/requests${qs}`)
+  },
+  getProjectCreationRequest: (id: string) =>
+    apiRequest<any>(`/projects/requests/${id}`),
+  castVoteOnProjectRequest: (
+    id: string,
+    body: { choice: 'APPROVE' | 'REJECT'; reason?: string },
+    mfaCode?: string,
+  ) =>
+    apiRequest<any>(`/projects/requests/${id}/vote`, {
+      method: 'POST',
+      headers: mfaCode
+        ? {
+            'X-MFA-Code': mfaCode,
+            'X-MFA-Action': 'votes:cast',
+            'X-MFA-Target': id,
+          }
+        : undefined,
+      body: JSON.stringify(body),
+    }),
+  decideProjectCreationRequest: (
+    id: string,
+    body: { decision: 'APPROVE' | 'REJECT'; reason: string },
+    mfaCode: string,
+  ) =>
+    apiRequest<any>(`/projects/requests/${id}/decide`, {
+      method: 'POST',
+      headers: {
+        'X-MFA-Code': mfaCode,
+        'X-MFA-Action': 'projects:create',
+        'X-MFA-Target': id,
+      },
+      body: JSON.stringify(body),
+    }),
+  createProjectProposal: (body: {
+    title: string
+    problemStatement: string
+    proposedSolution: string
+    targetManagerId: string
+    expectedBenefits?: string
+    isConfidentialGrievance?: boolean
+    category?: string
+  }) =>
+    apiRequest<any>('/projects/proposals', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  listProjectProposals: (params?: { role?: 'requester' | 'reviewer' }) => {
+    const qs = params?.role ? `?role=${params.role}` : ''
+    return apiRequest<any[]>(`/projects/proposals${qs}`)
+  },
+  reviewProjectProposal: (
+    id: string,
+    body: {
+      action: 'FORWARD' | 'RETURN' | 'DECLINE'
+      reviewNotes: string
+      initialBudget?: number
+    },
+  ) =>
+    apiRequest<any>(`/projects/proposals/${id}/review`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  getMyRequestsTimeline: () =>
+    apiRequest<any[]>('/projects/my-requests'),
+}

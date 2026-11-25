@@ -1,0 +1,78 @@
+# Pointfex ERP — Deployment Guide
+
+## Production URLs
+
+- Frontend: `https://erp-pointfex.vercel.app`
+- Backend: `https://backend-erp-pointfex.vercel.app`
+- Health: `https://backend-erp-pointfex.vercel.app/api/health`
+- Readiness: `https://backend-erp-pointfex.vercel.app/api/ready`
+
+Pushes to `main` run backend and frontend verification in GitHub Actions. Both Vercel
+production projects deploy only after every verification job succeeds. Runtime secrets
+live in Vercel and GitHub Actions secrets; real `.env` files are ignored and must never
+be committed.
+
+GitHub Actions deploys to the `erp-pointfex` frontend project and the
+`backend-erp-pointfex` backend project. Keep the GitHub repository connected only to
+these canonical Vercel projects; disconnect obsolete duplicate projects such as
+`pointfex-frontend` and `pointfex-backend` to prevent duplicate or failing deployment
+checks.
+
+Configure these GitHub Actions secrets for the deployment job:
+
+- `VERCEL_TOKEN`: a valid Vercel account or team access token. Create it in Vercel
+  Account Settings -> Tokens, then store the token as a GitHub repository or
+  `production` environment secret. Rotate the token if the deploy job reports that
+  it is invalid or expired.
+- `VERCEL_SCOPE` (optional): the Vercel team slug or ID when both projects belong to a team.
+
+## 1. Local Development
+1. Copy `backend/.env.example` -> `backend/.env` and `frontend/.env.example` -> `frontend/.env`.
+2. Start PostgreSQL, backend, and frontend:
+   ```bash
+   ./start-local.sh
+   ```
+3. Apply migrations and seed once:
+   ```bash
+   cd backend && npx prisma migrate deploy && SEED_PROFILE=production npm run prisma:seed
+   ```
+
+## 2. Docker Compose (VPS)
+1. Set production variables (use `backend/.env.production.example` as reference; never use default passwords).
+2. Build and start:
+   ```bash
+   docker compose -f docker-compose.prod.yml up -d --build
+   ```
+3. Verify `/api/health` and `/api/ready`.
+
+## 3. Neon Production Deployment Order (Exact Sequence)
+1. **Build**: `cd backend && npm run build` and `cd frontend && npm run build`.
+2. **Apply migrations (owner `DIRECT_URL`)**:
+   ```bash
+   cd backend && npx prisma migrate deploy
+   ```
+3. **Seed production baseline once**:
+   ```bash
+   SEED_PROFILE=production npm run prisma:seed
+   ```
+   Remove `CEO_INITIAL_PASSWORD` and `SEED_DEFAULT_PASSWORD` from `.env` after seeding.
+4. **Create least-privilege runtime role (`pointfex_app`)**:
+   - Open Neon Console -> SQL Editor as `neondb_owner`.
+   - Execute `backend/scripts/neon-setup-app-role.sql` after replacing `REPLACE_WITH_STRONG_APP_ROLE_PASSWORD`.
+5. **Switch runtime `DATABASE_URL`**:
+   - Point `DATABASE_URL` to the pooled Neon host using `pointfex_app` with `?sslmode=require&pgbouncer=true&connect_timeout=15`.
+   - Keep `DIRECT_URL` on the owner role for future `prisma migrate deploy` runs only.
+6. **Verify Resend & Google OAuth**:
+   - Verify your sending domain in Resend and set `MAIL_FROM`.
+   - Set `CORS_ORIGIN` to `https://erp-pointfex.vercel.app`.
+   - Set `FRONTEND_URL` to `https://erp-pointfex.vercel.app`.
+   - Set backend `GOOGLE_REDIRECT_URI` to
+     `https://backend-erp-pointfex.vercel.app/api/auth/google/callback`.
+   - Add that exact same URL to Google Cloud Console under **Authorized redirect URIs**.
+7. **Enable default-deny allowlist LAST**:
+   - Sign in as CEO -> **Admin & Governance > Login access** -> add initial allowed emails.
+   - Set `LOGIN_ALLOWLIST_REQUIRED="true"` and restart backend.
+
+## 4. Rollback & Backup Advice
+- **Backups**: Use Neon PITR branching or `pg_dump "$DIRECT_URL"` before migrations.
+- **Rollback**: Redeploy the previous git tag (`pre-release-baseline` or `release-candidate-1`). Never run `prisma migrate reset` on production.

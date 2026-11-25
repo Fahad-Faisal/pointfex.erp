@@ -1,0 +1,11 @@
+{
+  "name": "pointfex-erp",
+  "version": "4.2.0",
+  "private": true,
+  "scripts": {
+    "verify:backend": "npm --prefix backend run verify",
+    "verify:frontend": "npm --prefix frontend run verify",
+    "verify:all": "npm run verify:backend && npm run verify:frontend"
+  }
+}
+

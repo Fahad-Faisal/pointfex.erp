@@ -1,0 +1,8 @@
+-- AlterTable
+ALTER TABLE "employees" DROP COLUMN IF EXISTS "bio",
+DROP COLUMN IF EXISTS "github",
+DROP COLUMN IF EXISTS "joinedSprint",
+DROP COLUMN IF EXISTS "location",
+DROP COLUMN IF EXISTS "phone",
+DROP COLUMN IF EXISTS "skills",
+DROP COLUMN IF EXISTS "timezone";

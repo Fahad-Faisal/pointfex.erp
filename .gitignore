@@ -1,0 +1,95 @@
+# Dependencies & Build Outputs
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/build/
+**/.vite/
+**/.vercel/
+**/coverage/
+
+# Environment & Secrets (never commit real secrets)
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.production.example
+**/secrets/
+**/*secret*
+!**/*secret*.ts
+!**/*secret*.tsx
+!**/*secret*.js
+!**/*secret*.md
+
+# Keys, Certificates & Credentials
+**/*.pem
+**/*.key
+**/*.crt
+**/*.cer
+**/*.p12
+**/*.pfx
+**/*.jks
+**/service-account*.json
+**/credentials*.json
+
+# Allowlist Exports, Database Dumps, Backups & Uploads
+**/allowed-emails*.txt
+**/*.sql.gz
+**/*.dump
+**/*.bak
+**/*.zip
+*.zip
+**/backups/
+**/uploads/
+
+# Logs, Caches & OS Files
+**/*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Local agent artifacts, skills, subagents & frameworks (Never commit to remote)
+.agents/
+.claude/
+.codex/
+CLAUDE.md
+CLAUDE.local.md
+*.claude*
+agents/
+skills/
+subagents/
+**/agents/
+**/skills/
+**/subagents/
+skills-lock.json
+
+# The A Stack & Private Packages
+*The_A_Stack*
+*The_A_Stack*.zip
+The_A_Stack.zip
+*A team*
+Ismail/
+
+# A-Team Framework protocols & seed docs
+docs/_seed/
+docs/INVENTORY.md
+docs/CONTEXT_PROTOCOL.md
+docs/SESSION_PROTOCOL.md
+docs/WORKFLOW.md
+docs/STACK.md
+docs/ARCHITECTURE.md
+docs/CLIENT_QUESTIONS.md
+docs/DATA_MODEL.md
+docs/DECISIONS.md
+docs/DESIGN.md
+docs/DOMAIN.md
+docs/LOG.md
+docs/PROJECT.md
+docs/ROADMAP.md
+docs/SECURITY.md
+
+
